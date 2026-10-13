@@ -462,34 +462,27 @@ class Translator:
         cls,
         smi: str,
         groups: str,
-        abbrev_map: Dict[str, str],
         probe: Chem.rdchem.Mol,
         error_msg: bool = False,
     ) -> Tuple[str, set[int]]:
-        """Temporarily distinguish substitutable dummy atoms for RDKit stereo parsing."""
-        if "@" not in smi or "*" not in smi:
+        """Temporarily distinguish labeled dummy atoms for RDKit stereo parsing.
+
+        Graph-identical ``*`` neighbours make RDKit drop tetrahedral and E/Z
+        stereo, although their labels (substituted or retained) differ.
+        """
+        if "*" not in smi or not any(token in smi for token in "@/\\"):
             return smi, set()
 
         star_indices = [atom.GetIdx() for atom in probe.GetAtoms() if atom.GetSymbol() == "*"]
         if len(star_indices) < 2:
             return smi, set()
 
-        substitutable_indices: set[int] = set()
-        for desc in cls.parse_groups(groups):
-            if not isinstance(desc.id, AtomIndex) or desc.is_dummy or not desc.symbol:
-                continue
-            lookup_symbol = desc.symbol + (desc.script or "")
-            if (
-                desc.symbol == "CH2"
-                or (desc.symbol == "CH" and desc.script == "2")
-                or lookup_symbol == "CN"
-                or lookup_symbol in abbrev_map
-            ):
-                substitutable_indices.add(int(desc.id))
-            elif lookup_symbol in PERIODIC_TABLE and not desc.multiple:
-                substitutable_indices.add(int(desc.id))
-
-        if not substitutable_indices.intersection(star_indices):
+        labeled_indices = {
+            int(desc.id)
+            for desc in cls.parse_groups(groups)
+            if isinstance(desc.id, AtomIndex) and not desc.is_dummy and desc.symbol
+        }
+        if not labeled_indices.intersection(star_indices):
             return smi, set()
 
         dummy_tokens: List[Tuple[int, int]] = []
@@ -520,7 +513,7 @@ class Translator:
 
         for (start, end), atom_idx in zip(dummy_tokens, star_indices):
             protected_parts.append(smi[last_end:start])
-            if atom_idx in substitutable_indices:
+            if atom_idx in labeled_indices:
                 while next_isotope in used_isotopes:
                     next_isotope += 1
                 protected_parts.append(f"[{next_isotope}*]")
@@ -595,6 +588,7 @@ class Translator:
                 sru=cls.has_symbolic_sru(caption),
             )
         composite_abbrevs = chem_utils.get_abbrev_smi()
+        ambiguous_composite_groups: set[int] = set()
 
         def keeps_an_open_site(desc: GroupDesc) -> bool:
             # The legacy loop attaches a table fragment at atom 0 and keeps
@@ -605,15 +599,35 @@ class Translator:
         if any(
             desc.symbol
             and any(token in desc.symbol for token in composite_symbols)
+            and not keeps_an_open_site(desc)
             for desc in composite_descs
-        ) and not any(keeps_an_open_site(desc) for desc in composite_descs):
+        ):
             try:
-                expanded = cls.substitute_markush(
+                from .markush import _substitute_markush_outputs
+            except ImportError:  # Support running from package directory.
+                from markush import _substitute_markush_outputs
+
+            try:
+                outputs = _substitute_markush_outputs(
                     caption,
                     {},
+                    max_outputs=1024,
                     error_msg=error_msg,
                     repeat_policy="best_effort",
+                    preserve_open_abbreviations=True,
                 )
+                # Several products means the composite reading is ambiguous.
+                # Keep the caption and stop the legacy loop from picking one.
+                expanded = outputs[0] if len(outputs) == 1 else caption
+                if len(outputs) > 1:
+                    ambiguous_composite_groups = {
+                        int(desc.id)
+                        for desc in composite_descs
+                        if isinstance(desc.id, AtomIndex)
+                        and desc.symbol
+                        and any(token in desc.symbol for token in composite_symbols)
+                        and not keeps_an_open_site(desc)
+                    }
             except (ValueError, RuntimeError):
                 expanded = caption
             if isinstance(expanded, str) and expanded != caption:
@@ -641,7 +655,7 @@ class Translator:
                 groups = repaired_groups
                 caption = cls.build_esmi(smi, groups, ext)
             stereo_safe_smi, temporary_isotopes = cls._protect_stereo_for_dummy_substitution(
-                smi, groups, abbrev_map, raw_mol, error_msg=error_msg
+                smi, groups, raw_mol, error_msg=error_msg
             )
             mol = raw_mol if stereo_safe_smi == smi else chem_utils.parse_smiles(stereo_safe_smi)
             if mol is None:
@@ -673,7 +687,6 @@ class Translator:
                 if mn > 0:
                     mapnum2idx[mn] = a.GetIdx()
 
-            to_remove: List[int] = []
             consumed_atom_groups: set[int] = set()
             preserve_dummy_groups = False
             has_markush_extensions = any(
@@ -724,6 +737,13 @@ class Translator:
                     continue
 
                 if not desc.symbol:
+                    continue
+
+                if (
+                    isinstance(desc.id, AtomIndex)
+                    and int(desc.id) in ambiguous_composite_groups
+                ):
+                    is_markush = True
                     continue
 
                 # Carbon chain repetition, e.g. (CH2)n.
@@ -789,7 +809,6 @@ class Translator:
 
                     try:
                         chem_utils.merge_group(tgt_mol=mol, src=src_smi, attach_idx=atom_idx)
-                        to_remove.append(atom_idx)
                         consumed_atom_groups.add(int(desc.id))
                     except Exception as e:
                         if error_msg:
@@ -810,9 +829,6 @@ class Translator:
                     continue
 
                 is_markush = True
-
-            for i in sorted(to_remove, reverse=True):
-                mol.RemoveAtom(i)
 
             cleared_temporary_isotopes = False
             for atom in mol.GetAtoms():
