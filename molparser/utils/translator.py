@@ -595,6 +595,7 @@ class Translator:
                 sru=cls.has_symbolic_sru(caption),
             )
         composite_abbrevs = chem_utils.get_abbrev_smi()
+        ambiguous_composite_groups: set[int] = set()
 
         def keeps_an_open_site(desc: GroupDesc) -> bool:
             # The legacy loop attaches a table fragment at atom 0 and keeps
@@ -605,15 +606,35 @@ class Translator:
         if any(
             desc.symbol
             and any(token in desc.symbol for token in composite_symbols)
+            and not keeps_an_open_site(desc)
             for desc in composite_descs
-        ) and not any(keeps_an_open_site(desc) for desc in composite_descs):
+        ):
             try:
-                expanded = cls.substitute_markush(
+                from .markush import _substitute_markush_outputs
+            except ImportError:  # Support running from package directory.
+                from markush import _substitute_markush_outputs
+
+            try:
+                outputs = _substitute_markush_outputs(
                     caption,
                     {},
+                    max_outputs=1024,
                     error_msg=error_msg,
                     repeat_policy="best_effort",
+                    preserve_open_abbreviations=True,
                 )
+                # Several products means the composite reading is ambiguous.
+                # Keep the caption and stop the legacy loop from picking one.
+                expanded = outputs[0] if len(outputs) == 1 else caption
+                if len(outputs) > 1:
+                    ambiguous_composite_groups = {
+                        int(desc.id)
+                        for desc in composite_descs
+                        if isinstance(desc.id, AtomIndex)
+                        and desc.symbol
+                        and any(token in desc.symbol for token in composite_symbols)
+                        and not keeps_an_open_site(desc)
+                    }
             except (ValueError, RuntimeError):
                 expanded = caption
             if isinstance(expanded, str) and expanded != caption:
@@ -724,6 +745,13 @@ class Translator:
                     continue
 
                 if not desc.symbol:
+                    continue
+
+                if (
+                    isinstance(desc.id, AtomIndex)
+                    and int(desc.id) in ambiguous_composite_groups
+                ):
+                    is_markush = True
                     continue
 
                 # Carbon chain repetition, e.g. (CH2)n.

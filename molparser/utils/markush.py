@@ -1585,6 +1585,7 @@ def _substitute_markush_outputs(
     repeat_policy: RepeatPolicy = "best_effort",
     terminal_policy: TerminalPolicy = "preserve",
     allow_physical_repeats: bool = True,
+    preserve_open_abbreviations: bool = False,
 ) -> list[str]:
     raw_caption = str(caption).strip()
     parsed = Translator.parse_caption(raw_caption, return_mol=True, error_msg=error_msg)
@@ -1607,6 +1608,14 @@ def _substitute_markush_outputs(
             continue
         if isinstance(desc.id, RingIndex) and desc.id.virtual:
             continue
+        if preserve_open_abbreviations:
+            symbol = (desc.symbol or "") + (desc.script or "")
+            fragment = chem_utils.get_abbrev_smi().get(symbol)
+            if fragment is not None and "*" in fragment:
+                # Refactor's legacy loop owns these attachment semantics. Keep
+                # the record so output formatting remaps it after other edits.
+                unresolved_group_records.append(_group_record(desc))
+                continue
         if isinstance(desc.id, AtomIndex) and _is_carbon_chain_repeat(desc):
             try:
                 states = _expand_atom_repetition(
