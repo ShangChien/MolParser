@@ -274,8 +274,13 @@ def merge_group(tgt_mol: Chem.rdchem.RWMol, src: str, attach_idx: int) -> None:
         "Attachment point must link to single bond"
     )
 
-    idx_map: Dict[int, int] = {}
+    # Turn the dummy itself into the fragment's anchor atom: the parent bond
+    # keeps its slot, so neighbour chirality and alkene stereo atoms stay valid.
+    tgt_mol.ReplaceAtom(attach_idx, src_mol.GetAtomWithIdx(0))
+    idx_map: Dict[int, int] = {0: attach_idx}
     for atom in src_mol.GetAtoms():
+        if atom.GetIdx() == 0:
+            continue
         i = tgt_mol.AddAtom(atom)
         idx_map[atom.GetIdx()] = i
         tgt_atom = tgt_mol.GetAtomWithIdx(i)
@@ -284,8 +289,6 @@ def merge_group(tgt_mol: Chem.rdchem.RWMol, src: str, attach_idx: int) -> None:
         j = idx_map[bond.GetBeginAtomIdx()]
         k = idx_map[bond.GetEndAtomIdx()]
         tgt_mol.AddBond(j, k, bond.GetBondType())
-    tgt_mol.RemoveBond(attach_idx, nb_idx)
-    tgt_mol.AddBond(nb_idx, idx_map[0], Chem.BondType.SINGLE)
 
 
 def remap_groups(mol: Chem.rdchem.Mol, groups: str, ring_info: tuple) -> str:
