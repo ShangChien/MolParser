@@ -919,6 +919,16 @@ def _draw_sgroup_boundary_parentheses(
     return bounds
 
 
+def _axial_annotations(groups: str) -> List[Tuple[int, int, str]]:
+    """Return definite stereogenic axes as (atom_1, atom_2, aR/aS)."""
+    groups = re.sub(r"<s>.*?</s>", "", groups, flags=re.DOTALL)
+    annotations: List[Tuple[int, int, str]] = []
+    for match in re.finditer(r"<x>\[(\d+):(\d+)\]:(Ra|Sa)</x>", groups):
+        label = "aR" if match.group(3) == "Ra" else "aS"
+        annotations.append((int(match.group(1)), int(match.group(2)), label))
+    return annotations
+
+
 def _virtual_arcs(groups: str) -> List[Tuple[int, str, int, int]]:
     arcs: List[Tuple[int, str, int, int]] = []
     seen_indices: set[int] = set()
@@ -1378,6 +1388,63 @@ def _serialize_svg(root: ET.Element) -> str:
         .replace("ns0:", "")
         .replace(f'xmlns:ns0="{_SVG_NAMESPACE}"', f'xmlns="{_SVG_NAMESPACE}"')
     )
+
+
+def _italicize_axial_labels(
+    svg_text: str,
+    anchors: List[Tuple[float, float]],
+    fill: str = "#010203",
+    slant: float = -14.0,
+) -> str:
+    """Shear sentinel-coloured aR/aS glyphs. RDKit's built-in font has no italic."""
+
+    if not anchors or fill not in svg_text:
+        return svg_text
+    path_re = re.compile(r"<path\b(?:[^>']|'[^']*')*?/>", re.DOTALL)
+
+    def _center(path: str) -> Tuple[float, float]:
+        drawn = re.search(r"\bd=(['\"])(.*?)\1", path, re.DOTALL)
+        if drawn is None:
+            return anchors[0]
+        nums = [float(n) for n in re.findall(r"[-+]?(?:\d+\.\d+|\d+)", drawn.group(2))]
+        xs, ys = nums[0::2], nums[1::2]
+        if not xs or not ys:
+            return anchors[0]
+        return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+    def _nearest(point: Tuple[float, float]) -> int:
+        px, py = point
+        return min(
+            range(len(anchors)),
+            key=lambda i: (anchors[i][0] - px) ** 2 + (anchors[i][1] - py) ** 2,
+        )
+
+    matches = list(path_re.finditer(svg_text))
+    pieces: List[str] = []
+    last = 0
+    index = 0
+    while index < len(matches):
+        match = matches[index]
+        if fill not in match.group(0):
+            index += 1
+            continue
+        anchor_idx = _nearest(_center(match.group(0)))
+        end = index + 1
+        while end < len(matches) and fill in matches[end].group(0):
+            if _nearest(_center(matches[end].group(0))) != anchor_idx:
+                break
+            end += 1
+        pieces.append(svg_text[last : match.start()])
+        cx, cy = anchors[anchor_idx]
+        body = svg_text[match.start() : matches[end - 1].end()].replace(fill, "#000000")
+        pieces.append(
+            f"<g transform='translate({cx:.2f},{cy:.2f}) skewX({slant:.1f}) "
+            f"translate({-cx:.2f},{-cy:.2f})'>{body}</g>"
+        )
+        last = matches[end - 1].end()
+        index = end
+    pieces.append(svg_text[last:])
+    return "".join(pieces)
 
 
 def _expand_svg_viewbox(svg_text: str, bounds: List[float], pad: float) -> str:
@@ -2510,12 +2577,118 @@ class _DrawingTranslator:
                 ring_bounds = _update_bounds(ring_bounds, min_x, min_y)
                 ring_bounds = _update_bounds(ring_bounds, max_x, max_y)
 
+        axial_anchors: List[Tuple[float, float]] = []
+        axial_annotations = _axial_annotations(groups)
+        if axial_annotations and drawer_type == "SVG":
+            conf = mol.GetConformer()
+            n_atoms = mol.GetNumAtoms()
+            # Publication aR/aS is italic and a touch smaller than atom labels.
+            # The built-in font cannot draw italic, so the glyphs are painted in
+            # a sentinel colour and sheared after the SVG is finished.
+            axial_font = float(drawing_config.visual.fixedFontSize) * 0.9
+            previous_font = drawer.FontSize() if hasattr(drawer, "FontSize") else None
+            if hasattr(drawer, "SetFontSize"):
+                drawer.SetFontSize(axial_font)
+            origin = drawer.GetDrawCoords(Point2D(0.0, 0.0))
+            unit = drawer.GetDrawCoords(Point2D(1.0, 0.0))
+            px_per_unit = math.hypot(unit.x - origin.x, unit.y - origin.y) or 1.0
+            try:
+                for atom_a, atom_b, label_text in axial_annotations:
+                    if not (0 <= atom_a < n_atoms and 0 <= atom_b < n_atoms) or atom_a == atom_b:
+                        continue
+                    pos_a = conf.GetAtomPosition(atom_a)
+                    pos_b = conf.GetAtomPosition(atom_b)
+                    dx, dy = pos_b.x - pos_a.x, pos_b.y - pos_a.y
+                    span = math.hypot(dx, dy)
+                    if span <= 1e-6:
+                        continue
+                    px, py = -dy / span, dx / span
+                    mid_x = (pos_a.x + pos_b.x) / 2.0
+                    mid_y = (pos_a.y + pos_b.y) / 2.0
+                    # Keep a short gap between the axis and the nearest glyph edge.
+                    half_w = axial_font * 0.30 * len(label_text) / px_per_unit
+                    half_h = axial_font * 0.50 / px_per_unit
+                    offset = 0.28 + half_w * abs(px) + half_h * abs(py)
+                    glyph_r = math.hypot(half_w, half_h)
+                    bonds = [
+                        (
+                            conf.GetAtomPosition(bond.GetBeginAtomIdx()),
+                            conf.GetAtomPosition(bond.GetEndAtomIdx()),
+                        )
+                        for bond in mol.GetBonds()
+                    ]
+
+                    def _bond_clearance(sx: float, sy: float) -> float:
+                        nearest = float("inf")
+                        for pos_1, pos_2 in bonds:
+                            vx, vy = pos_2.x - pos_1.x, pos_2.y - pos_1.y
+                            length_sq = vx * vx + vy * vy or 1e-12
+                            t = max(0.0, min(1.0, ((sx - pos_1.x) * vx + (sy - pos_1.y) * vy) / length_sq))
+                            nearest = min(
+                                nearest,
+                                math.hypot(sx - (pos_1.x + t * vx), sy - (pos_1.y + t * vy)),
+                            )
+                        return nearest
+
+                    # Stay beside the axis. If that point lands on a bond, swing
+                    # a little and only then step outward.
+                    need = glyph_r + 0.08
+                    label_x, label_y = mid_x + px * offset, mid_y + py * offset
+                    best_rank = None
+                    for scale in (1.0, 1.25, 1.55):
+                        found = False
+                        for deg in (0, 18, -18, 36, -36, 54, -54):
+                            ang = math.radians(deg)
+                            ca, sa = math.cos(ang), math.sin(ang)
+                            rx, ry = px * ca - py * sa, px * sa + py * ca
+                            for sign in (1.0, -1.0):
+                                sx = mid_x + rx * offset * scale * sign
+                                sy = mid_y + ry * offset * scale * sign
+                                clear = _bond_clearance(sx, sy)
+                                ok = clear >= need
+                                rank = (ok, -scale, -abs(deg), clear)
+                                if best_rank is None or rank > best_rank:
+                                    best_rank = rank
+                                    label_x, label_y = sx, sy
+                                if ok and scale == 1.0 and deg == 0:
+                                    found = True
+                        if best_rank is not None and best_rank[0]:
+                            found = True
+                        if found:
+                            break
+                    label_pt = Point2D(label_x, label_y)
+                    drawer.SetColour((1 / 255, 2 / 255, 3 / 255))
+                    drawer.DrawString(label_text, label_pt, 0)
+                    draw_label = drawer.GetDrawCoords(label_pt)
+                    axial_anchors.append((draw_label.x, draw_label.y))
+                    ring_bounds = _update_bounds(ring_bounds, draw_label.x, draw_label.y)
+                    text_min_x, text_min_y, text_max_x, text_max_y = _estimate_text_bounds(
+                        label_text,
+                        draw_label.x,
+                        draw_label.y,
+                        font_px=axial_font,
+                        margin=8.0,
+                    )
+                    ring_bounds = _update_bounds(ring_bounds, text_min_x, text_min_y)
+                    ring_bounds = _update_bounds(ring_bounds, text_max_x, text_max_y)
+            finally:
+                if previous_font is not None and hasattr(drawer, "SetFontSize"):
+                    drawer.SetFontSize(previous_font)
+
         drawer.FinishDrawing()
+        if drawer_type != "SVG":
+            if write_to is not None:
+                Path(write_to).parent.mkdir(parents=True, exist_ok=True)
+                drawer.WriteDrawingText(write_to)
+                return
+            return drawer.GetDrawingText()
+        svg_text = drawer.GetDrawingText()
+        if axial_anchors:
+            svg_text = _italicize_axial_labels(svg_text, axial_anchors)
         if write_to is not None:
             Path(write_to).parent.mkdir(parents=True, exist_ok=True)
-            drawer.WriteDrawingText(write_to)
+            Path(write_to).write_text(svg_text)
             return
-        svg_text = drawer.GetDrawingText()
         if ring_bounds is not None:
             svg_text = _expand_svg_viewbox(svg_text, ring_bounds, pad=6.0)
         return svg_text
