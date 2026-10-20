@@ -919,13 +919,32 @@ def _draw_sgroup_boundary_parentheses(
     return bounds
 
 
+def _axial_label(state: str) -> str:
+    """Publication label: italic (R_a) / (S_a), matching the Ra / Sa token."""
+    letter = "R" if state == "Ra" else "S"
+    return f"({letter}<sub>a</sub>)"
+
+
+def _axial_label_em_width(label_text: str) -> float:
+    """Glyph widths in ems. A subscript is narrower than a full-size character."""
+    width = 0.0
+    for part in re.split(r"(<sub>.*?</sub>)", label_text):
+        subscript = re.fullmatch(r"<sub>(.*?)</sub>", part)
+        if subscript:
+            width += 0.6 * len(subscript.group(1))
+        else:
+            width += len(part)
+    return max(width, 1.0)
+
+
 def _axial_annotations(groups: str) -> List[Tuple[int, int, str]]:
-    """Return definite stereogenic axes as (atom_1, atom_2, aR/aS)."""
+    """Return definite stereogenic axes as (atom_1, atom_2, label)."""
     groups = re.sub(r"<s>.*?</s>", "", groups, flags=re.DOTALL)
     annotations: List[Tuple[int, int, str]] = []
     for match in re.finditer(r"<x>\[(\d+):(\d+)\]:(Ra|Sa)</x>", groups):
-        label = "aR" if match.group(3) == "Ra" else "aS"
-        annotations.append((int(match.group(1)), int(match.group(2)), label))
+        annotations.append(
+            (int(match.group(1)), int(match.group(2)), _axial_label(match.group(3)))
+        )
     return annotations
 
 
@@ -1396,7 +1415,7 @@ def _italicize_axial_labels(
     fill: str = "#010203",
     slant: float = -14.0,
 ) -> str:
-    """Shear sentinel-coloured aR/aS glyphs. RDKit's built-in font has no italic."""
+    """Shear sentinel-coloured axial labels. RDKit's built-in font has no italic."""
 
     if not anchors or fill not in svg_text:
         return svg_text
@@ -2582,10 +2601,11 @@ class _DrawingTranslator:
         if axial_annotations and drawer_type == "SVG":
             conf = mol.GetConformer()
             n_atoms = mol.GetNumAtoms()
-            # Publication aR/aS is italic and a touch smaller than atom labels.
+            # (R_a)/(S_a) is italic. It is one point smaller than the previous
+            # axial label, which was already 0.9 times the atom-label size.
             # The built-in font cannot draw italic, so the glyphs are painted in
             # a sentinel colour and sheared after the SVG is finished.
-            axial_font = float(drawing_config.visual.fixedFontSize) * 0.9
+            axial_font = max(1.0, float(drawing_config.visual.fixedFontSize) * 0.9 - 1.0)
             previous_font = drawer.FontSize() if hasattr(drawer, "FontSize") else None
             if hasattr(drawer, "SetFontSize"):
                 drawer.SetFontSize(axial_font)
@@ -2606,7 +2626,7 @@ class _DrawingTranslator:
                     mid_x = (pos_a.x + pos_b.x) / 2.0
                     mid_y = (pos_a.y + pos_b.y) / 2.0
                     # Keep a short gap between the axis and the nearest glyph edge.
-                    half_w = axial_font * 0.30 * len(label_text) / px_per_unit
+                    half_w = axial_font * 0.30 * _axial_label_em_width(label_text) / px_per_unit
                     half_h = axial_font * 0.50 / px_per_unit
                     offset = 0.28 + half_w * abs(px) + half_h * abs(py)
                     glyph_r = math.hypot(half_w, half_h)
