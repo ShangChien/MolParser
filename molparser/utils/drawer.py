@@ -155,6 +155,163 @@ def _random_color() -> Tuple[float, float, float]:
     )
 
 
+def _ring_end_clearance(centers, conf, atom_rings, extension: float, mol) -> float:
+    """How far the label beyond the last centre sits from the rest of the molecule."""
+    x1, y1, _prev_idx = centers[-2]
+    x2, y2, last_idx = centers[-1]
+    dx, dy = x2 - x1, y2 - y1
+    span = math.hypot(dx, dy)
+    if span <= 1e-6:
+        return -1.0
+    ux, uy = dx / span, dy / span
+    radius = max(
+        math.hypot(
+            conf.GetAtomPosition(atom_idx).x - x2,
+            conf.GetAtomPosition(atom_idx).y - y2,
+        )
+        for atom_idx in atom_rings[last_idx]
+    )
+    px = x2 + ux * (radius + extension)
+    py = y2 + uy * (radius + extension)
+    terminal = set(atom_rings[last_idx])
+    nearest = float("inf")
+    for atom_idx in range(mol.GetNumAtoms()):
+        if atom_idx in terminal:
+            continue
+        pos = conf.GetAtomPosition(atom_idx)
+        nearest = min(nearest, math.hypot(pos.x - px, pos.y - py))
+    return nearest
+
+
+def _segment_clearance(x1: float, y1: float, x2: float, y2: float, mol, conf, skip) -> float:
+    """Nearest distance from a non-skipped atom to a segment."""
+    vx, vy = x2 - x1, y2 - y1
+    length_sq = vx * vx + vy * vy
+    nearest = float("inf")
+    for atom_idx in range(mol.GetNumAtoms()):
+        if atom_idx in skip:
+            continue
+        pos = conf.GetAtomPosition(atom_idx)
+        wx, wy = pos.x - x1, pos.y - y1
+        if length_sq <= 1e-12:
+            distance = math.hypot(wx, wy)
+        else:
+            t = max(0.0, min(1.0, (wx * vx + wy * vy) / length_sq))
+            distance = math.hypot(wx - t * vx, wy - t * vy)
+        nearest = min(nearest, distance)
+    return nearest
+
+
+def _leader_direction(
+    x_prev: float,
+    y_prev: float,
+    x: float,
+    y: float,
+    radius: float,
+    extension: float,
+    mol,
+    conf,
+    skip,
+) -> Tuple[float, float]:
+    """Unit vector for the label leader.
+
+    Continue the centre line when that ray is clear.  If a substituent sits
+    on it, swing the leader just far enough to clear the collision.
+    """
+    dx, dy = x - x_prev, y - y_prev
+    span = math.hypot(dx, dy)
+    if span <= 1e-6:
+        base_x, base_y = 1.0, 0.0
+    else:
+        base_x, base_y = dx / span, dy / span
+    base_angle = math.atan2(base_y, base_x)
+
+    def clearance(vx: float, vy: float) -> float:
+        start_x = x + vx * radius
+        start_y = y + vy * radius
+        end_x = x + vx * (radius + extension + 0.25)
+        end_y = y + vy * (radius + extension + 0.25)
+        return _segment_clearance(start_x, start_y, end_x, end_y, mol, conf, skip)
+
+    straight = clearance(base_x, base_y)
+    if straight >= 0.7:
+        return base_x, base_y
+    best_dir = (base_x, base_y)
+    best_score = straight
+    for step in range(1, 12):
+        for sign in (1, -1):
+            angle = base_angle + sign * step * math.radians(15)
+            vx, vy = math.cos(angle), math.sin(angle)
+            score = clearance(vx, vy)
+            if score >= 0.7:
+                return vx, vy
+            if score > best_score:
+                best_score = score
+                best_dir = (vx, vy)
+    return best_dir
+
+
+def _order_rings_outward(centers, conf, atom_rings, extension: float, mol):
+    """Keep the centre line, but put the label on the end that clears the molecule."""
+    if len(centers) < 2:
+        return centers
+    forward = _ring_end_clearance(centers, conf, atom_rings, extension, mol)
+    reversed_centers = list(reversed(centers))
+    backward = _ring_end_clearance(reversed_centers, conf, atom_rings, extension, mol)
+    if backward > forward:
+        return reversed_centers
+    return centers
+
+
+def _draw_outward_label(drawer, anchor: Point2D, outward: Point2D, text: str) -> None:
+    """Draw a label on the outer side of a leader.
+
+    RDKit START alignment always runs left to right, so a leftward leader
+    would otherwise lay the text back across the structure.
+    """
+    start = drawer.GetDrawCoords(anchor)
+    end = drawer.GetDrawCoords(outward)
+    dx = end.x - start.x
+    # START runs to the right and END to the left.  Centre only a nearly
+    # vertical leader, where either side would pull the text back onto the ring.
+    if dx >= 8:
+        align = 1
+    elif dx <= -8:
+        align = 2
+    else:
+        align = 0
+    drawer.DrawString(text, anchor, align)
+
+
+def _draw_connector(
+    drawer,
+    start: Point2D,
+    end: Point2D,
+    style: Literal["dashed", "solid"],
+) -> None:
+    """Draw one annotation segment, solid or dashed, in molecule coordinates."""
+    if style == "solid":
+        drawer.DrawLine(start, end)
+        return
+    dx = end.x - start.x
+    dy = end.y - start.y
+    length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        return
+    ux, uy = dx / length, dy / length
+    dash_length = 0.15
+    gap_length = 0.1
+    offset = 0.0
+    while offset < length:
+        end_offset = min(offset + dash_length, length)
+        if end_offset > offset:
+            drawer.DrawLine(
+                Point2D(start.x + ux * offset, start.y + uy * offset),
+                Point2D(start.x + ux * end_offset, start.y + uy * end_offset),
+            )
+        offset = end_offset + gap_length
+
+
 def _update_bounds(bounds: Optional[List[float]], x: float, y: float) -> List[float]:
     if bounds is None:
         return [x, y, x, y]
@@ -762,6 +919,35 @@ def _draw_sgroup_boundary_parentheses(
     return bounds
 
 
+def _axial_label(state: str) -> str:
+    """Publication label: italic (R_a) / (S_a), matching the Ra / Sa token."""
+    letter = "R" if state == "Ra" else "S"
+    return f"({letter}<sub>a</sub>)"
+
+
+def _axial_label_em_width(label_text: str) -> float:
+    """Glyph widths in ems. A subscript is narrower than a full-size character."""
+    width = 0.0
+    for part in re.split(r"(<sub>.*?</sub>)", label_text):
+        subscript = re.fullmatch(r"<sub>(.*?)</sub>", part)
+        if subscript:
+            width += 0.6 * len(subscript.group(1))
+        else:
+            width += len(part)
+    return max(width, 1.0)
+
+
+def _axial_annotations(groups: str) -> List[Tuple[int, int, str]]:
+    """Return definite stereogenic axes as (atom_1, atom_2, label)."""
+    groups = re.sub(r"<s>.*?</s>", "", groups, flags=re.DOTALL)
+    annotations: List[Tuple[int, int, str]] = []
+    for match in re.finditer(r"<x>\[(\d+):(\d+)\]:(Ra|Sa)</x>", groups):
+        annotations.append(
+            (int(match.group(1)), int(match.group(2)), _axial_label(match.group(3)))
+        )
+    return annotations
+
+
 def _virtual_arcs(groups: str) -> List[Tuple[int, str, int, int]]:
     arcs: List[Tuple[int, str, int, int]] = []
     seen_indices: set[int] = set()
@@ -1223,6 +1409,63 @@ def _serialize_svg(root: ET.Element) -> str:
     )
 
 
+def _italicize_axial_labels(
+    svg_text: str,
+    anchors: List[Tuple[float, float]],
+    fill: str = "#010203",
+    slant: float = -14.0,
+) -> str:
+    """Shear sentinel-coloured axial labels. RDKit's built-in font has no italic."""
+
+    if not anchors or fill not in svg_text:
+        return svg_text
+    path_re = re.compile(r"<path\b(?:[^>']|'[^']*')*?/>", re.DOTALL)
+
+    def _center(path: str) -> Tuple[float, float]:
+        drawn = re.search(r"\bd=(['\"])(.*?)\1", path, re.DOTALL)
+        if drawn is None:
+            return anchors[0]
+        nums = [float(n) for n in re.findall(r"[-+]?(?:\d+\.\d+|\d+)", drawn.group(2))]
+        xs, ys = nums[0::2], nums[1::2]
+        if not xs or not ys:
+            return anchors[0]
+        return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+    def _nearest(point: Tuple[float, float]) -> int:
+        px, py = point
+        return min(
+            range(len(anchors)),
+            key=lambda i: (anchors[i][0] - px) ** 2 + (anchors[i][1] - py) ** 2,
+        )
+
+    matches = list(path_re.finditer(svg_text))
+    pieces: List[str] = []
+    last = 0
+    index = 0
+    while index < len(matches):
+        match = matches[index]
+        if fill not in match.group(0):
+            index += 1
+            continue
+        anchor_idx = _nearest(_center(match.group(0)))
+        end = index + 1
+        while end < len(matches) and fill in matches[end].group(0):
+            if _nearest(_center(matches[end].group(0))) != anchor_idx:
+                break
+            end += 1
+        pieces.append(svg_text[last : match.start()])
+        cx, cy = anchors[anchor_idx]
+        body = svg_text[match.start() : matches[end - 1].end()].replace(fill, "#000000")
+        pieces.append(
+            f"<g transform='translate({cx:.2f},{cy:.2f}) skewX({slant:.1f}) "
+            f"translate({-cx:.2f},{-cy:.2f})'>{body}</g>"
+        )
+        last = matches[end - 1].end()
+        index = end
+    pieces.append(svg_text[last:])
+    return "".join(pieces)
+
+
 def _expand_svg_viewbox(svg_text: str, bounds: List[float], pad: float) -> str:
     try:
         root = ET.fromstring(svg_text)
@@ -1299,7 +1542,7 @@ class _DrawingPatterns:
     )
     grp_pattern = re.compile(
         rf"({Tokens.atom_start}|{Tokens.circ_start}|{Tokens.dummy_start}|{Tokens.ring_start}|{Tokens.ring_start}{Tokens.circ_start}|{Tokens.ring_start}{Tokens.virtual_start})"
-        + r"(\d+:\S*?)"
+        + r"(\d+(?:,\d+)*:\S*?)"
         + rf"({Tokens.atom_end}|{Tokens.circ_end}|{Tokens.dummy_end}|{Tokens.ring_end})"
     )
     trail_pattern = Patterns.trail_pattern
@@ -1387,7 +1630,10 @@ class _DrawingTranslator:
             parsed = cls.parse_group(grp_content)
             if parsed is None:
                 continue
-            idx, grp_text = parsed
+            indexes, grp_text = parsed
+            if len(indexes) != 1 and grp_start != Tokens.ring_start:
+                continue
+            idx = indexes[0]
             if grp_start in (Tokens.atom_start, Tokens.dummy_start):
                 grp_desc = GroupDesc(id=AtomIndex(idx))
                 if len(grp_text) == 0 or grp_start == Tokens.dummy_start:
@@ -1400,7 +1646,7 @@ class _DrawingTranslator:
             ):
                 grp_desc = GroupDesc(id=RingIndex(idx, virtual=True))
             elif grp_start == Tokens.ring_start:
-                grp_desc = GroupDesc(id=RingIndex(idx))
+                grp_desc = GroupDesc(id=RingIndex(idx, indices=indexes))
             else:
                 continue
             symbol = grp_text.get(TextType.SYMBOL)
@@ -1414,20 +1660,22 @@ class _DrawingTranslator:
         return descriptions
 
     @classmethod
-    def parse_group(cls, group: str) -> Optional[Tuple[int, Dict[TextType, str]]]:
+    def parse_group(
+        cls, group: str
+    ) -> Optional[Tuple[tuple[int, ...], Dict[TextType, str]]]:
         items = group.split(":")
         if len(items) != 2:
             return
         idx, content = items
-        if not idx.isdigit():
+        if re.fullmatch(r"\d+(?:,\d+)*", idx) is None:
             return
-        idx = int(idx)
+        indexes = tuple(dict.fromkeys(int(part) for part in idx.split(",")))
         if content == Tokens.dummy or content == "":
-            return idx, {}
+            return indexes, {}
         grp_text = cls.get_group_texts(content)
         if len(grp_text) == 0:
             return
-        return idx, grp_text
+        return indexes, grp_text
 
     @classmethod
     def get_group_texts(cls, content: str) -> Dict[TextType, str]:
@@ -1542,6 +1790,7 @@ class _DrawingTranslator:
 
         ring_captions: List[str] = []
         ring_annotations: List[Tuple[int, str]] = []
+        multi_ring_annotations: List[Tuple[tuple[int, ...], str]] = []
         virtual_ring_annotations: List[Tuple[int, str]] = []
         endpoint_balls: Dict[int, str] = {}
         for desc in grp_descriptions:
@@ -1588,34 +1837,40 @@ class _DrawingTranslator:
                     if ball_token is None:
                         endpoint_balls.pop(i, None)
             elif isinstance(desc.id, RingIndex):
-                if (
-                    (not desc.id.virtual)
-                    and (not 0 <= i < mol.GetRingInfo().NumRings())
-                    or (desc.id.virtual)
-                    and (i not in circ_indices)
-                    or desc.symbol is None
-                ):
-                    continue
-                if desc.symbol is not None:
-                    if desc.multiple:
-                        ring_label_text = "("
-                        ring_label_text += desc.symbol
-                        if desc.script:
-                            ring_label_text += "<sub>" + desc.script + "</sub>"
-                        if desc.prime:
-                            ring_label_text += desc.prime
-                        ring_label_text += ")"
-                        ring_label_text += "<sub>" + desc.multiple + "</sub>"
-                    else:
-                        ring_label_text = desc.symbol
-                        if desc.script:
-                            ring_label_text += "<sub>" + desc.script + "</sub>"
-                        if desc.prime:
-                            ring_label_text += desc.prime
-                    if desc.id.virtual:
-                        virtual_ring_annotations.append((i, ring_label_text))
-                    else:
-                        ring_annotations.append((i, ring_label_text))
+                n_rings = mol.GetRingInfo().NumRings()
+                if desc.id.virtual:
+                    if i not in circ_indices or desc.symbol is None:
+                        continue
+                    ring_ids: tuple[int, ...] = (i,)
+                else:
+                    ring_ids = desc.id.indices
+                    if (
+                        desc.symbol is None
+                        or not ring_ids
+                        or any(not 0 <= ring_idx < n_rings for ring_idx in ring_ids)
+                    ):
+                        continue
+                if desc.multiple:
+                    ring_label_text = "("
+                    ring_label_text += desc.symbol
+                    if desc.script:
+                        ring_label_text += "<sub>" + desc.script + "</sub>"
+                    if desc.prime:
+                        ring_label_text += desc.prime
+                    ring_label_text += ")"
+                    ring_label_text += "<sub>" + desc.multiple + "</sub>"
+                else:
+                    ring_label_text = desc.symbol
+                    if desc.script:
+                        ring_label_text += "<sub>" + desc.script + "</sub>"
+                    if desc.prime:
+                        ring_label_text += desc.prime
+                if desc.id.virtual:
+                    virtual_ring_annotations.append((i, ring_label_text))
+                elif len(ring_ids) == 1:
+                    ring_annotations.append((ring_ids[0], ring_label_text))
+                else:
+                    multi_ring_annotations.append((ring_ids, ring_label_text))
 
         # A legacy whole-SRU has no <d> records to suppress the two terminal
         # dummy labels.  Once its endpoints have passed the deliberately
@@ -1902,6 +2157,25 @@ class _DrawingTranslator:
 
         if (
             drawing_config.features.ring_annotations
+            and multi_ring_annotations
+            and drawer_type == "SVG"
+        ):
+            atom_rings = mol.GetRingInfo().AtomRings()
+            kept_multi: List[Tuple[tuple[int, ...], str]] = []
+            for ring_ids, label_text in multi_ring_annotations:
+                drawable = tuple(
+                    ring_idx
+                    for ring_idx in ring_ids
+                    if 0 <= ring_idx < len(atom_rings) and atom_rings[ring_idx]
+                )
+                if len(drawable) >= 2:
+                    kept_multi.append((drawable, label_text))
+                elif len(drawable) == 1:
+                    ring_annotations.append((drawable[0], label_text))
+            multi_ring_annotations = kept_multi
+
+        if (
+            drawing_config.features.ring_annotations
             and ring_annotations
             and drawer_type == "SVG"
         ):
@@ -1962,6 +2236,25 @@ class _DrawingTranslator:
                     midpoint_distance = ring_radius
                 extension = drawing_config.styling.ring_connector_extension
                 total_length = midpoint_distance + extension
+                label_align_outward = False
+                if len(label_texts) > 1:
+                    lead_x, lead_y = _leader_direction(
+                        center_x - direction_x,
+                        center_y - direction_y,
+                        center_x,
+                        center_y,
+                        ring_radius,
+                        extension,
+                        mol,
+                        conf,
+                        set(ring_atoms),
+                    )
+                    if (
+                        abs(lead_x - direction_x) > 1e-9
+                        or abs(lead_y - direction_y) > 1e-9
+                    ):
+                        direction_x, direction_y = lead_x, lead_y
+                        label_align_outward = True
 
                 base_angle = math.atan2(direction_y, direction_x)
                 spread = math.radians(26)
@@ -2005,7 +2298,18 @@ class _DrawingTranslator:
                         center_y + label_dir_y * (total_length + label_offset),
                     )
                     drawer.SetColour((0, 0, 0))
-                    drawer.DrawString(label_text, label_pt, 1)
+                    if label_align_outward:
+                        _draw_outward_label(
+                            drawer,
+                            label_pt,
+                            Point2D(
+                                center_x + label_dir_x * (total_length + label_offset + 1.0),
+                                center_y + label_dir_y * (total_length + label_offset + 1.0),
+                            ),
+                            label_text,
+                        )
+                    else:
+                        drawer.DrawString(label_text, label_pt, 1)
 
                     draw_center = drawer.GetDrawCoords(Point2D(center_x, center_y))
                     draw_label = drawer.GetDrawCoords(label_pt)
@@ -2028,6 +2332,115 @@ class _DrawingTranslator:
                     )
                     ring_bounds = _update_bounds(ring_bounds, min_x, min_y)
                     ring_bounds = _update_bounds(ring_bounds, max_x, max_y)
+
+        if (
+            drawing_config.features.ring_annotations
+            and multi_ring_annotations
+            and drawer_type == "SVG"
+        ):
+            conf = mol.GetConformer()
+            atom_rings = mol.GetRingInfo().AtomRings()
+            drawer.SetLineWidth(1)
+            drawer.SetColour((0, 0, 0))
+            grouped_rings: Dict[tuple[int, ...], List[str]] = {}
+            for ring_ids, label_text in multi_ring_annotations:
+                grouped_rings.setdefault(ring_ids, []).append(label_text)
+            connector_style = drawing_config.styling.ring_connector_style
+            connector_extension = drawing_config.styling.ring_connector_extension
+            for ring_ids, label_texts in grouped_rings.items():
+                centers: List[Tuple[float, float, int]] = []
+                for ring_idx in ring_ids:
+                    ring_atoms = atom_rings[ring_idx]
+                    if not ring_atoms:
+                        continue
+                    centers.append(
+                        (
+                            sum(conf.GetAtomPosition(idx).x for idx in ring_atoms)
+                            / len(ring_atoms),
+                            sum(conf.GetAtomPosition(idx).y for idx in ring_atoms)
+                            / len(ring_atoms),
+                            ring_idx,
+                        )
+                    )
+                if len(centers) < 2:
+                    continue
+                centers = _order_rings_outward(
+                    centers, conf, atom_rings, connector_extension, mol
+                )
+                x1, y1, _prev_idx = centers[-2]
+                x2, y2, last_idx = centers[-1]
+                dx, dy = x2 - x1, y2 - y1
+                span = math.hypot(dx, dy)
+                if span <= 1e-6:
+                    continue
+                for (x1, y1, _), (x2, y2, _) in zip(centers, centers[1:]):
+                    _draw_connector(
+                        drawer, Point2D(x1, y1), Point2D(x2, y2), connector_style
+                    )
+                    for px, py in ((x1, y1), (x2, y2)):
+                        draw_pt = drawer.GetDrawCoords(Point2D(px, py))
+                        ring_bounds = _update_bounds(ring_bounds, draw_pt.x, draw_pt.y)
+                x1, y1, _prev_idx = centers[-2]
+                x2, y2, last_idx = centers[-1]
+                radius = max(
+                    math.hypot(
+                        conf.GetAtomPosition(atom_idx).x - x2,
+                        conf.GetAtomPosition(atom_idx).y - y2,
+                    )
+                    for atom_idx in atom_rings[last_idx]
+                )
+                lead_x, lead_y = _leader_direction(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    radius,
+                    connector_extension,
+                    mol,
+                    conf,
+                    set(atom_rings[last_idx]),
+                )
+                base_angle = math.atan2(lead_y, lead_x)
+                spread = math.radians(26)
+                label_offset = 0.25
+                for label_idx, label_text in enumerate(label_texts):
+                    angle_offset = (
+                        label_idx - (len(label_texts) - 1) / 2.0
+                    ) * spread
+                    angle = base_angle + angle_offset
+                    label_dir_x = math.cos(angle)
+                    label_dir_y = math.sin(angle)
+                    outer = Point2D(
+                        x2 + label_dir_x * (radius + connector_extension),
+                        y2 + label_dir_y * (radius + connector_extension),
+                    )
+                    _draw_connector(drawer, Point2D(x2, y2), outer, connector_style)
+                    label_pt = Point2D(
+                        x2 + label_dir_x * (radius + connector_extension + label_offset),
+                        y2 + label_dir_y * (radius + connector_extension + label_offset),
+                    )
+                    _draw_outward_label(
+                        drawer,
+                        label_pt,
+                        Point2D(
+                            x2 + label_dir_x * (radius + connector_extension + label_offset + 1.0),
+                            y2 + label_dir_y * (radius + connector_extension + label_offset + 1.0),
+                        ),
+                        label_text,
+                    )
+                    for pt in (outer, label_pt):
+                        draw_pt = drawer.GetDrawCoords(pt)
+                        ring_bounds = _update_bounds(ring_bounds, draw_pt.x, draw_pt.y)
+                    draw_label = drawer.GetDrawCoords(label_pt)
+                    text_min_x, text_min_y, text_max_x, text_max_y = _estimate_text_bounds(
+                        label_text,
+                        draw_label.x,
+                        draw_label.y,
+                        font_px=float(drawing_config.visual.fixedFontSize),
+                        margin=4.0,
+                    )
+                    ring_bounds = _update_bounds(ring_bounds, text_min_x, text_min_y)
+                    ring_bounds = _update_bounds(ring_bounds, text_max_x, text_max_y)
 
         rendered_sgroups: Optional[set[str]] = None
         if repeat_units:
@@ -2183,12 +2596,119 @@ class _DrawingTranslator:
                 ring_bounds = _update_bounds(ring_bounds, min_x, min_y)
                 ring_bounds = _update_bounds(ring_bounds, max_x, max_y)
 
+        axial_anchors: List[Tuple[float, float]] = []
+        axial_annotations = _axial_annotations(groups)
+        if axial_annotations and drawer_type == "SVG":
+            conf = mol.GetConformer()
+            n_atoms = mol.GetNumAtoms()
+            # (R_a)/(S_a) is italic. It is one point smaller than the previous
+            # axial label, which was already 0.9 times the atom-label size.
+            # The built-in font cannot draw italic, so the glyphs are painted in
+            # a sentinel colour and sheared after the SVG is finished.
+            axial_font = max(1.0, float(drawing_config.visual.fixedFontSize) * 0.9 - 1.0)
+            previous_font = drawer.FontSize() if hasattr(drawer, "FontSize") else None
+            if hasattr(drawer, "SetFontSize"):
+                drawer.SetFontSize(axial_font)
+            origin = drawer.GetDrawCoords(Point2D(0.0, 0.0))
+            unit = drawer.GetDrawCoords(Point2D(1.0, 0.0))
+            px_per_unit = math.hypot(unit.x - origin.x, unit.y - origin.y) or 1.0
+            try:
+                for atom_a, atom_b, label_text in axial_annotations:
+                    if not (0 <= atom_a < n_atoms and 0 <= atom_b < n_atoms) or atom_a == atom_b:
+                        continue
+                    pos_a = conf.GetAtomPosition(atom_a)
+                    pos_b = conf.GetAtomPosition(atom_b)
+                    dx, dy = pos_b.x - pos_a.x, pos_b.y - pos_a.y
+                    span = math.hypot(dx, dy)
+                    if span <= 1e-6:
+                        continue
+                    px, py = -dy / span, dx / span
+                    mid_x = (pos_a.x + pos_b.x) / 2.0
+                    mid_y = (pos_a.y + pos_b.y) / 2.0
+                    # Keep a short gap between the axis and the nearest glyph edge.
+                    half_w = axial_font * 0.30 * _axial_label_em_width(label_text) / px_per_unit
+                    half_h = axial_font * 0.50 / px_per_unit
+                    offset = 0.28 + half_w * abs(px) + half_h * abs(py)
+                    glyph_r = math.hypot(half_w, half_h)
+                    bonds = [
+                        (
+                            conf.GetAtomPosition(bond.GetBeginAtomIdx()),
+                            conf.GetAtomPosition(bond.GetEndAtomIdx()),
+                        )
+                        for bond in mol.GetBonds()
+                    ]
+
+                    def _bond_clearance(sx: float, sy: float) -> float:
+                        nearest = float("inf")
+                        for pos_1, pos_2 in bonds:
+                            vx, vy = pos_2.x - pos_1.x, pos_2.y - pos_1.y
+                            length_sq = vx * vx + vy * vy or 1e-12
+                            t = max(0.0, min(1.0, ((sx - pos_1.x) * vx + (sy - pos_1.y) * vy) / length_sq))
+                            nearest = min(
+                                nearest,
+                                math.hypot(sx - (pos_1.x + t * vx), sy - (pos_1.y + t * vy)),
+                            )
+                        return nearest
+
+                    # Stay beside the axis. If that point lands on a bond, swing
+                    # a little and only then step outward.
+                    need = glyph_r + 0.08
+                    label_x, label_y = mid_x + px * offset, mid_y + py * offset
+                    best_rank = None
+                    for scale in (1.0, 1.25, 1.55):
+                        found = False
+                        for deg in (0, 18, -18, 36, -36, 54, -54):
+                            ang = math.radians(deg)
+                            ca, sa = math.cos(ang), math.sin(ang)
+                            rx, ry = px * ca - py * sa, px * sa + py * ca
+                            for sign in (1.0, -1.0):
+                                sx = mid_x + rx * offset * scale * sign
+                                sy = mid_y + ry * offset * scale * sign
+                                clear = _bond_clearance(sx, sy)
+                                ok = clear >= need
+                                rank = (ok, -scale, -abs(deg), clear)
+                                if best_rank is None or rank > best_rank:
+                                    best_rank = rank
+                                    label_x, label_y = sx, sy
+                                if ok and scale == 1.0 and deg == 0:
+                                    found = True
+                        if best_rank is not None and best_rank[0]:
+                            found = True
+                        if found:
+                            break
+                    label_pt = Point2D(label_x, label_y)
+                    drawer.SetColour((1 / 255, 2 / 255, 3 / 255))
+                    drawer.DrawString(label_text, label_pt, 0)
+                    draw_label = drawer.GetDrawCoords(label_pt)
+                    axial_anchors.append((draw_label.x, draw_label.y))
+                    ring_bounds = _update_bounds(ring_bounds, draw_label.x, draw_label.y)
+                    text_min_x, text_min_y, text_max_x, text_max_y = _estimate_text_bounds(
+                        label_text,
+                        draw_label.x,
+                        draw_label.y,
+                        font_px=axial_font,
+                        margin=8.0,
+                    )
+                    ring_bounds = _update_bounds(ring_bounds, text_min_x, text_min_y)
+                    ring_bounds = _update_bounds(ring_bounds, text_max_x, text_max_y)
+            finally:
+                if previous_font is not None and hasattr(drawer, "SetFontSize"):
+                    drawer.SetFontSize(previous_font)
+
         drawer.FinishDrawing()
+        if drawer_type != "SVG":
+            if write_to is not None:
+                Path(write_to).parent.mkdir(parents=True, exist_ok=True)
+                drawer.WriteDrawingText(write_to)
+                return
+            return drawer.GetDrawingText()
+        svg_text = drawer.GetDrawingText()
+        if axial_anchors:
+            svg_text = _italicize_axial_labels(svg_text, axial_anchors)
         if write_to is not None:
             Path(write_to).parent.mkdir(parents=True, exist_ok=True)
-            drawer.WriteDrawingText(write_to)
+            Path(write_to).write_text(svg_text)
             return
-        svg_text = drawer.GetDrawingText()
         if ring_bounds is not None:
             svg_text = _expand_svg_viewbox(svg_text, ring_bounds, pad=6.0)
         return svg_text
